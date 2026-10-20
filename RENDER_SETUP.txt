@@ -1,0 +1,11 @@
+MINGLE Docker image for Render
+
+1. Install Docker Desktop on Windows.
+2. Open terminal in this MINGLE_FullStack folder.
+3. docker login
+4. docker build -t YOUR_DOCKERHUB_USERNAME/mingle:latest .
+5. docker push YOUR_DOCKERHUB_USERNAME/mingle:latest
+6. In Render > New Web Service > Existing Image, enter docker.io/YOUR_DOCKERHUB_USERNAME/mingle:latest
+7. Choose an available instance and deploy.
+
+WARNING: This is a development prototype, NOT safe for public use with real users. It lacks production security, moderation and persistent sessions. SQLite data on Render ephemeral storage can disappear after redeploy/restart. Do not collect real user data until these issues are fixed.
