@@ -10,7 +10,7 @@ def db():
  c=sqlite3.connect(DB,timeout=15); c.row_factory=sqlite3.Row; return c
 def init():
  with db() as c:
-  c.executescript('''CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL, salt TEXT NOT NULL, password TEXT NOT NULL, bio TEXT DEFAULT '', created TEXT DEFAULT CURRENT_TIMESTAMP); CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY, sender INTEGER NOT NULL, recipient INTEGER NOT NULL, body TEXT NOT NULL, created TEXT DEFAULT CURRENT_TIMESTAMP); CREATE TABLE IF NOT EXISTS friendships(user_id INTEGER NOT NULL, friend_id INTEGER NOT NULL, UNIQUE(user_id,friend_id)); CREATE TABLE IF NOT EXISTS rooms(id INTEGER PRIMARY KEY, title TEXT, category TEXT, host TEXT);''')
+  c.executescript('''CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL, salt TEXT NOT NULL, password TEXT NOT NULL, bio TEXT DEFAULT '', created TEXT DEFAULT CURRENT_TIMESTAMP); CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY, sender INTEGER NOT NULL, recipient INTEGER NOT NULL, body TEXT NOT NULL, created TEXT DEFAULT CURRENT_TIMESTAMP); CREATE TABLE IF NOT EXISTS friendships(user_id INTEGER NOT NULL, friend_id INTEGER NOT NULL, UNIQUE(user_id,friend_id)); CREATE TABLE IF NOT EXISTS rooms(id INTEGER PRIMARY KEY, title TEXT, category TEXT, host TEXT); CREATE TABLE IF NOT EXISTS calls(id INTEGER PRIMARY KEY, caller INTEGER NOT NULL, callee INTEGER NOT NULL, kind TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'ringing', created TEXT DEFAULT CURRENT_TIMESTAMP); CREATE TABLE IF NOT EXISTS call_signals(id INTEGER PRIMARY KEY, call_id INTEGER NOT NULL, sender INTEGER NOT NULL, recipient INTEGER NOT NULL, payload TEXT NOT NULL);''')
   if not c.execute('SELECT COUNT(*) FROM rooms').fetchone()[0]: c.executemany('INSERT INTO rooms(title,category,host) VALUES(?,?,?)',[('Tamil Chill Vibes','Tamil','Mingle'),('Music & Memories','Music','Mingle'),('Late Night Talks','Hangout','Mingle'),('New Friends Corner','Friends','Mingle'),('Gaming Squad','Games','Mingle'),('English Café','English','Mingle')])
 def password(p,s): return hashlib.pbkdf2_hmac('sha256',p.encode(),bytes.fromhex(s),220000).hex()
 def public_user(r): return {'id':r['id'],'name':r['name'],'bio':r['bio'] or '', 'initial':r['name'][:1].upper()}
@@ -39,6 +39,19 @@ class Handler(BaseHTTPRequestHandler):
    if path=='/api/rooms':
     with db() as c:return self.reply({'rooms':[dict(r) for r in c.execute('SELECT * FROM rooms')]})
    if not u:return self.reply({'error':'Please log in'},401)
+   if path=='/api/calls':
+    with db() as c:
+     rows=c.execute("SELECT * FROM calls WHERE (caller=? OR callee=?) AND state IN ('ringing','active') ORDER BY id DESC LIMIT 20",(u['id'],u['id'])).fetchall()
+     return self.reply({'calls':[dict(r) for r in rows]})
+   if path=='/api/signals':
+    from urllib.parse import parse_qs
+    try: call_id=int(parse_qs(urlparse(self.path).query).get('call',['0'])[0]);after=int(parse_qs(urlparse(self.path).query).get('after',['0'])[0])
+    except:return self.reply({'error':'Invalid call'},400)
+    with db() as c:
+     call=c.execute('SELECT * FROM calls WHERE id=? AND (caller=? OR callee=?)',(call_id,u['id'],u['id'])).fetchone()
+     if not call:return self.reply({'error':'Call not found'},404)
+     rows=c.execute('SELECT id,payload FROM call_signals WHERE call_id=? AND recipient=? AND id>? ORDER BY id LIMIT 100',(call_id,u['id'],after)).fetchall()
+     return self.reply({'signals':[{'id':r['id'],'data':json.loads(r['payload'])} for r in rows]})
    with db() as c:
     if path=='/api/people':return self.reply({'people':[public_user(r) for r in c.execute('SELECT * FROM users WHERE id != ? ORDER BY id DESC LIMIT 100',(u['id'],))]})
     if path=='/api/friends':return self.reply({'friends':[public_user(r) for r in c.execute('SELECT u.* FROM users u JOIN friendships f ON u.id=f.friend_id WHERE f.user_id=?',(u['id'],))]})
@@ -74,6 +87,35 @@ class Handler(BaseHTTPRequestHandler):
    return self.reply({'ok':True},cookie='mingle_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0')
   u=self.user()
   if not u:return self.reply({'error':'Please log in'},401)
+  if path=='/api/call/start':
+   try:other=int(data.get('to'));kind=str(data.get('kind'))
+   except:return self.reply({'error':'Invalid call'},400)
+   if kind not in ('audio','video') or other==u['id']:return self.reply({'error':'Invalid call'},400)
+   with db() as c:
+    if not c.execute('SELECT id FROM users WHERE id=?',(other,)).fetchone():return self.reply({'error':'User not found'},404)
+    c.execute("UPDATE calls SET state='ended' WHERE (caller=? OR callee=?) AND state IN ('ringing','active')",(u['id'],u['id']))
+    cur=c.execute('INSERT INTO calls(caller,callee,kind,state) VALUES(?,?,?,?)',(u['id'],other,kind,'ringing'))
+    return self.reply({'call':cur.lastrowid})
+  if path=='/api/call/state':
+   try:cid=int(data.get('call'));state=str(data.get('state'))
+   except:return self.reply({'error':'Invalid call'},400)
+   if state not in ('active','ended'):return self.reply({'error':'Invalid state'},400)
+   with db() as c:
+    call=c.execute('SELECT * FROM calls WHERE id=? AND (caller=? OR callee=?)',(cid,u['id'],u['id'])).fetchone()
+    if not call:return self.reply({'error':'Call not found'},404)
+    if state=='active' and (call['callee']!=u['id'] or call['state']!='ringing'):return self.reply({'error':'Cannot accept'},403)
+    c.execute('UPDATE calls SET state=? WHERE id=?',(state,cid))
+   return self.reply({'ok':True})
+  if path=='/api/call/signal':
+   try:cid=int(data.get('call'));payload=data.get('data')
+   except:return self.reply({'error':'Invalid signal'},400)
+   if not isinstance(payload,dict) or len(json.dumps(payload))>12000:return self.reply({'error':'Invalid signal'},400)
+   with db() as c:
+    call=c.execute("SELECT * FROM calls WHERE id=? AND state IN ('ringing','active') AND (caller=? OR callee=?)",(cid,u['id'],u['id'])).fetchone()
+    if not call:return self.reply({'error':'Call unavailable'},404)
+    other=call['callee'] if call['caller']==u['id'] else call['caller']
+    c.execute('INSERT INTO call_signals(call_id,sender,recipient,payload) VALUES(?,?,?,?)',(cid,u['id'],other,json.dumps(payload)))
+   return self.reply({'ok':True})
   if path=='/api/profile':
    name=str(data.get('name','')).strip();bio=str(data.get('bio','')).strip()
    if not 2<=len(name)<=40 or len(bio)>180:return self.reply({'error':'Invalid name or bio'},400)
