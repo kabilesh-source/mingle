@@ -1,8 +1,8 @@
-MINGLE - Windows + Phone Friendly Full Stack Starter
+VIBELY - Windows + Phone Friendly Full Stack Starter
 ====================================================
 1. Install Python 3 (if not already installed). No pip install or npm needed.
 2. Extract this ZIP completely.
-3. Double-click START_MINGLE.bat on Windows.
+3. Double-click START_VIBELY.bat on Windows.
 4. In your Windows browser, open http://localhost:8765
 5. To open on your phone: connect phone and PC to the same Wi-Fi. Find the PC's local IPv4 address using ipconfig, then open http://PC_IP_ADDRESS:8765 on your phone. Allow Python through Windows Firewall on private networks if asked.
 6. Leave the command window open while using the app. Close it to stop the server.

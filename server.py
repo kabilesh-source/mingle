@@ -6,14 +6,29 @@ from pathlib import Path
 ROOT=Path(__file__).resolve().parent
 DB=ROOT/'mingle.db'
 SESS={}
+CALLS={} # ephemeral call state, only real accounts
+CALL_EVENTS={}
+import threading, time
+CALL_LOCK=threading.Lock()
+def emit(uid,event):
+ with CALL_LOCK:
+  CALL_EVENTS.setdefault(uid,[]).append(dict(event,seq=time.time_ns()))
+  CALL_EVENTS[uid]=CALL_EVENTS[uid][-100:]
 def db():
  c=sqlite3.connect(DB,timeout=15); c.row_factory=sqlite3.Row; return c
 def init():
  with db() as c:
-  c.executescript('''CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL, salt TEXT NOT NULL, password TEXT NOT NULL, bio TEXT DEFAULT '', created TEXT DEFAULT CURRENT_TIMESTAMP); CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY, sender INTEGER NOT NULL, recipient INTEGER NOT NULL, body TEXT NOT NULL, created TEXT DEFAULT CURRENT_TIMESTAMP); CREATE TABLE IF NOT EXISTS friendships(user_id INTEGER NOT NULL, friend_id INTEGER NOT NULL, UNIQUE(user_id,friend_id)); CREATE TABLE IF NOT EXISTS rooms(id INTEGER PRIMARY KEY, title TEXT, category TEXT, host TEXT); CREATE TABLE IF NOT EXISTS calls(id INTEGER PRIMARY KEY, caller INTEGER NOT NULL, callee INTEGER NOT NULL, kind TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'ringing', created TEXT DEFAULT CURRENT_TIMESTAMP); CREATE TABLE IF NOT EXISTS call_signals(id INTEGER PRIMARY KEY, call_id INTEGER NOT NULL, sender INTEGER NOT NULL, recipient INTEGER NOT NULL, payload TEXT NOT NULL);''')
+  c.executescript('''CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL, salt TEXT NOT NULL, password TEXT NOT NULL, bio TEXT DEFAULT '', created TEXT DEFAULT CURRENT_TIMESTAMP); CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY, sender INTEGER NOT NULL, recipient INTEGER NOT NULL, body TEXT NOT NULL, created TEXT DEFAULT CURRENT_TIMESTAMP); CREATE TABLE IF NOT EXISTS friendships(user_id INTEGER NOT NULL, friend_id INTEGER NOT NULL, UNIQUE(user_id,friend_id)); CREATE TABLE IF NOT EXISTS rooms(id INTEGER PRIMARY KEY, title TEXT, category TEXT, host TEXT);''')
   if not c.execute('SELECT COUNT(*) FROM rooms').fetchone()[0]: c.executemany('INSERT INTO rooms(title,category,host) VALUES(?,?,?)',[('Tamil Chill Vibes','Tamil','Mingle'),('Music & Memories','Music','Mingle'),('Late Night Talks','Hangout','Mingle'),('New Friends Corner','Friends','Mingle'),('Gaming Squad','Games','Mingle'),('English Café','English','Mingle')])
+  # Clearly labeled sample profiles for UI testing; not real members.
+  demos=[('Arjun Kumar','Gaming, cricket and weekend hangouts 🎮'),('Priya S','Music lover 🎧 | Chennai vibes'),('Naveen Raj','Tech talks and new friendships 💻'),('Divya M','Coffee, books and good conversations ☕'),('Karthik V','Football and movies ⚽'),('Meera Anand','Art, travel and photography 📷'),('Rahul Dev','Late night music sessions 🎵'),('Anu Sri','Foodie exploring new places 🍜'),('Sanjay R','Anime and gaming buddy 🎮'),('Keerthana P','Dancing and positive vibes ✨'),('Vishal N','Coding and startup ideas 🚀'),('Harini B','Books, nature and pets 🐾')]
+  for i,(name,bio) in enumerate(demos,1):
+   email=f'mingle-demo-{i}@example.invalid'
+   if not c.execute('SELECT id FROM users WHERE email=?',(email,)).fetchone():
+    salt=secrets.token_hex(16)
+    c.execute('INSERT INTO users(name,email,salt,password,bio) VALUES(?,?,?,?,?)',(name,email,salt,hashlib.pbkdf2_hmac('sha256',secrets.token_bytes(24),bytes.fromhex(salt),220000).hex(),bio))
 def password(p,s): return hashlib.pbkdf2_hmac('sha256',p.encode(),bytes.fromhex(s),220000).hex()
-def public_user(r): return {'id':r['id'],'name':r['name'],'bio':r['bio'] or '', 'initial':r['name'][:1].upper()}
+def public_user(r): return {'id':r['id'],'name':r['name'],'bio':r['bio'] or '', 'initial':r['name'][:1].upper(), 'demo':r['email'].endswith('@example.invalid')}
 class Handler(BaseHTTPRequestHandler):
  def log_message(self,*a): pass
  def reply(self,obj,status=200,cookie=None):
@@ -39,19 +54,11 @@ class Handler(BaseHTTPRequestHandler):
    if path=='/api/rooms':
     with db() as c:return self.reply({'rooms':[dict(r) for r in c.execute('SELECT * FROM rooms')]})
    if not u:return self.reply({'error':'Please log in'},401)
-   if path=='/api/calls':
-    with db() as c:
-     rows=c.execute("SELECT * FROM calls WHERE (caller=? OR callee=?) AND state IN ('ringing','active') ORDER BY id DESC LIMIT 20",(u['id'],u['id'])).fetchall()
-     return self.reply({'calls':[dict(r) for r in rows]})
-   if path=='/api/signals':
+   if path=='/api/call/events':
     from urllib.parse import parse_qs
-    try: call_id=int(parse_qs(urlparse(self.path).query).get('call',['0'])[0]);after=int(parse_qs(urlparse(self.path).query).get('after',['0'])[0])
-    except:return self.reply({'error':'Invalid call'},400)
-    with db() as c:
-     call=c.execute('SELECT * FROM calls WHERE id=? AND (caller=? OR callee=?)',(call_id,u['id'],u['id'])).fetchone()
-     if not call:return self.reply({'error':'Call not found'},404)
-     rows=c.execute('SELECT id,payload FROM call_signals WHERE call_id=? AND recipient=? AND id>? ORDER BY id LIMIT 100',(call_id,u['id'],after)).fetchall()
-     return self.reply({'signals':[{'id':r['id'],'data':json.loads(r['payload'])} for r in rows]})
+    since=int(parse_qs(urlparse(self.path).query).get('since',['0'])[0])
+    with CALL_LOCK: events=[e for e in CALL_EVENTS.get(u['id'],[]) if e['seq']>since]
+    return self.reply({'events':events})
    with db() as c:
     if path=='/api/people':return self.reply({'people':[public_user(r) for r in c.execute('SELECT * FROM users WHERE id != ? ORDER BY id DESC LIMIT 100',(u['id'],))]})
     if path=='/api/friends':return self.reply({'friends':[public_user(r) for r in c.execute('SELECT u.* FROM users u JOIN friendships f ON u.id=f.friend_id WHERE f.user_id=?',(u['id'],))]})
@@ -64,7 +71,7 @@ class Handler(BaseHTTPRequestHandler):
   if path=='/':path='/index.html'
   target=(ROOT/'public'/path.lstrip('/')).resolve()
   if not target.is_relative_to((ROOT/'public').resolve()) or not target.is_file():self.send_error(404);return
-  raw=target.read_bytes();self.send_response(200);self.send_header('Content-Type',mimetypes.guess_type(target)[0] or 'text/plain');self.send_header('Content-Length',str(len(raw)));self.end_headers();self.wfile.write(raw)
+  raw=target.read_bytes();self.send_response(200);self.send_header('Content-Type',mimetypes.guess_type(target)[0] or 'text/plain');self.send_header('Content-Length',str(len(raw)));self.send_header('Cache-Control','no-store, max-age=0');self.end_headers();self.wfile.write(raw)
  def do_POST(self):
   path=urlparse(self.path).path
   try:data=self.body()
@@ -87,34 +94,13 @@ class Handler(BaseHTTPRequestHandler):
    return self.reply({'ok':True},cookie='mingle_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0')
   u=self.user()
   if not u:return self.reply({'error':'Please log in'},401)
-  if path=='/api/call/start':
-   try:other=int(data.get('to'));kind=str(data.get('kind'))
-   except:return self.reply({'error':'Invalid call'},400)
-   if kind not in ('audio','video') or other==u['id']:return self.reply({'error':'Invalid call'},400)
-   with db() as c:
-    if not c.execute('SELECT id FROM users WHERE id=?',(other,)).fetchone():return self.reply({'error':'User not found'},404)
-    c.execute("UPDATE calls SET state='ended' WHERE (caller=? OR callee=?) AND state IN ('ringing','active')",(u['id'],u['id']))
-    cur=c.execute('INSERT INTO calls(caller,callee,kind,state) VALUES(?,?,?,?)',(u['id'],other,kind,'ringing'))
-    return self.reply({'call':cur.lastrowid})
-  if path=='/api/call/state':
-   try:cid=int(data.get('call'));state=str(data.get('state'))
-   except:return self.reply({'error':'Invalid call'},400)
-   if state not in ('active','ended'):return self.reply({'error':'Invalid state'},400)
-   with db() as c:
-    call=c.execute('SELECT * FROM calls WHERE id=? AND (caller=? OR callee=?)',(cid,u['id'],u['id'])).fetchone()
-    if not call:return self.reply({'error':'Call not found'},404)
-    if state=='active' and (call['callee']!=u['id'] or call['state']!='ringing'):return self.reply({'error':'Cannot accept'},403)
-    c.execute('UPDATE calls SET state=? WHERE id=?',(state,cid))
-   return self.reply({'ok':True})
   if path=='/api/call/signal':
-   try:cid=int(data.get('call'));payload=data.get('data')
-   except:return self.reply({'error':'Invalid signal'},400)
-   if not isinstance(payload,dict) or len(json.dumps(payload))>12000:return self.reply({'error':'Invalid signal'},400)
-   with db() as c:
-    call=c.execute("SELECT * FROM calls WHERE id=? AND state IN ('ringing','active') AND (caller=? OR callee=?)",(cid,u['id'],u['id'])).fetchone()
-    if not call:return self.reply({'error':'Call unavailable'},404)
-    other=call['callee'] if call['caller']==u['id'] else call['caller']
-    c.execute('INSERT INTO call_signals(call_id,sender,recipient,payload) VALUES(?,?,?,?)',(cid,u['id'],other,json.dumps(payload)))
+   try: other=int(data.get('to'));kind=str(data.get('type'));payload=data.get('payload',{})
+   except:return self.reply({'error':'Bad signal'},400)
+   if other==u['id'] or kind not in ('offer','answer','ice','hangup','reject') or len(json.dumps(payload))>12000:return self.reply({'error':'Invalid call signal'},400)
+   with db() as c: target=c.execute('SELECT * FROM users WHERE id=?',(other,)).fetchone()
+   if not target or target['email'].endswith('@example.invalid') or u['email'].endswith('@example.invalid'):return self.reply({'error':'Calls only work between real registered users, not DEMO profiles'},400)
+   emit(other,{'from':u['id'],'name':u['name'],'type':kind,'payload':payload})
    return self.reply({'ok':True})
   if path=='/api/profile':
    name=str(data.get('name','')).strip();bio=str(data.get('bio','')).strip()
@@ -141,6 +127,6 @@ class Handler(BaseHTTPRequestHandler):
   return self.reply({'error':'Not found'},404)
 if __name__=='__main__':
  init();port=int(os.environ.get('PORT','8765'));server=ThreadingHTTPServer(('0.0.0.0',port),Handler)
- print(f'MINGLE is running: http://localhost:{port}',flush=True)
+ print(f'VIBELY is running: http://localhost:{port}',flush=True)
  try:server.serve_forever()
  except KeyboardInterrupt:pass

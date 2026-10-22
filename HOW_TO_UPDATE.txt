@@ -1,0 +1,8 @@
+VIBELY 2.0
+1. Extract this ZIP into a NEW folder.
+2. Run START_VIBELY.bat (Python must be installed).
+3. Open the localhost address printed in the command window.
+4. Press Ctrl+Shift+R to force browser refresh.
+5. If using Render: deploy the NEW files via GitHub and wait for deployment.
+12 profiles are clearly labelled DEMO. They are not real people and do not send automatic messages.
+Note: Existing mingle.db can be copied into this folder to retain your accounts/messages.
